@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import requests
 from dataclasses import dataclass
 from app.config import get_settings
@@ -136,6 +138,39 @@ class RazorpayAdapter:
                 "status",
                 "created",
             ),
+        )
+
+    def verify_payment_signature(
+        self,
+        *,
+        order_id: str,
+        payment_id: str,
+        signature: str,
+    ) -> bool:
+        """
+        Verify the Razorpay payment signature locally.
+
+        Razorpay signs:
+            order_id|payment_id
+
+        using the Razorpay key secret and HMAC-SHA256.
+        """
+        if not self.key_secret:
+            raise RazorpayError(
+                "RAZORPAY_NOT_CONFIGURED",
+                "Razorpay credentials are not configured.",
+            )
+
+        message = f"{order_id}|{payment_id}".encode("utf-8")
+        expected_signature = hmac.new(
+            self.key_secret.encode("utf-8"),
+            message,
+            hashlib.sha256,
+        ).hexdigest()
+
+        return hmac.compare_digest(
+            expected_signature,
+            signature,
         )
 
 razorpay_adapter = RazorpayAdapter()

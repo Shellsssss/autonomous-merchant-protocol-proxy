@@ -7,7 +7,9 @@ import app.api.settle as settle_module
 from app.services.deal_store import deal_store
 from app.services import razorpay_adapter as razorpay_module
 from app.services.razorpay_adapter import RazorpayOrder
+from app.core.transaction import TransactionState
 from app.core.transaction_store import transaction_store
+from app.services.receipt_store import receipt_store
 
 client = TestClient(app)
 
@@ -19,36 +21,41 @@ def reset_state(monkeypatch):
     inventory._inventory["HEADPHONES-01"].available_quantity = 50
     inventory._holds.clear()
 
+    # Reset deal store
+    deal_store._deals.clear()
+
     # Reset transaction store
     transaction_store.clear()
+
+    # Reset receipt store
+    receipt_store.clear()
 
     # Reset settlement idempotency state
     settlement_ledger._records.clear()
     settlement_ledger._used_nonces.clear()
 
-    # Reset deal store
-    deal_store._deals.clear()
+    # Reset payment verification legder
+    settle_module.payment_verification_ledger._records.clear()
+    settle_module.payment_verification_ledger._used_nonces.clear()
 
     # Mock Razorpay for settlement tests
     class FakeRazorpayAdapter:
-        def create_order(
-            self,
-            *,
-            transaction_id: str,
-            amount: int,
-            currency: str,
-        ) -> RazorpayOrder:
+        def create_order(self, *, transaction_id: str, amount: int, currency: str) -> RazorpayOrder:
             return RazorpayOrder(
                 order_id=f"order_test_{transaction_id}",
                 amount=amount,
                 currency=currency,
                 status="created",
             )
-    monkeypatch.setattr(
-        settle_module,
-        "razorpay_adapter",
-        FakeRazorpayAdapter(),
-    )
+        def verify_payment_signature(
+            self,
+            *,
+            order_id: str,
+            payment_id: str,
+            signature: str,
+        ) -> bool:
+            return signature == f"valid_{order_id}_{payment_id}"
+    monkeypatch.setattr(settle_module, "razorpay_adapter", FakeRazorpayAdapter())
 
 def make_proposal(
     *,
@@ -75,8 +82,41 @@ def create_negotiated_deal():
     assert data["state"] == "HELD"
     assert data["hold_token"]
     assert data["transaction_id"]
-
     return data
+
+def settle_deal(deal):
+    response = client.post(
+        "/api/v1/agent/settle",
+        headers={
+            "Idempotency-Key": f"settle-{deal['transaction_id']}",
+        },
+        json={
+            "transaction_id": deal["transaction_id"],
+            "hold_token": deal["hold_token"],
+            "nonce": f"nonce-{deal['transaction_id']}-123456",
+        },
+    )
+    assert response.status_code == 200
+    return response.json()
+
+def verify_payment(deal):
+    payment = settle_deal(deal)
+    order_id = payment["payment_id"]
+    payment_id = "pay_test_123"
+    response = client.post(
+        "/api/v1/agent/verify-payment",
+        headers={
+            "Idempotency-Key": f"verify-{deal['transaction_id']}",
+        },
+        json={
+            "transaction_id": deal["transaction_id"],
+            "order_id": order_id,
+            "payment_id": payment_id,
+            "signature": f"valid_{order_id}_{payment_id}",
+        },
+    )
+    assert response.status_code == 200
+    return response.json()
 
 def test_settlement_requires_idempotency_key():
     deal = create_negotiated_deal()
@@ -106,23 +146,53 @@ def test_valid_settlement_succeeds():
             "nonce": "nonce_settlement_002",
         },
     )
-    print("STATUS:", response.status_code)
-    print("RESPONSE:", response.json())
     assert response.status_code == 200
 
     data = response.json()
     assert data["transaction_id"] == deal["transaction_id"]
-    assert data["status"] == "SETTLED"
+    assert data["status"] == "PAYMENT_PENDING"
     assert data["payment_id"]
-    assert data["amount"] == 4800
-    assert data["currency"] == "INR"
-    assert data["receipt_digest"]
+    assert data["amount"] == deal["total_amount"]
+    assert data["currency"] == deal["currency"]
 
-def test_successful_settlement_commits_inventory():
+    transaction = transaction_store.get(
+        deal["transaction_id"]
+    )
+    assert transaction.state == TransactionState.PAYMENT_PENDING
+    assert transaction.payment_order_id == data["payment_id"]
+    assert transaction.payment_id is None
+
+# def test_successful_settlement_commits_inventory():
+#     deal = create_negotiated_deal()
+#     before = inventory.get_available_quantity(
+#         "LAPTOP-PRO-01"
+#     )
+#     response = client.post(
+#         "/api/v1/agent/settle",
+#         headers={
+#             "Idempotency-Key": "settlement-key-002",
+#         },
+#         json={
+#             "transaction_id": deal["transaction_id"],
+#             "hold_token": deal["hold_token"],
+#             "nonce": "nonce_settlement_003",
+#         },
+#     )
+#     assert response.status_code == 200
+
+#     after = inventory.get_available_quantity(
+#         "LAPTOP-PRO-01"
+#     )
+#     # One unit was held and then committed.
+#     assert before == 9
+#     assert after == 9
+
+def test_successful_settlement_keeps_inventory_held():
     deal = create_negotiated_deal()
     before = inventory.get_available_quantity(
         "LAPTOP-PRO-01"
     )
+
     response = client.post(
         "/api/v1/agent/settle",
         headers={
@@ -139,9 +209,26 @@ def test_successful_settlement_commits_inventory():
     after = inventory.get_available_quantity(
         "LAPTOP-PRO-01"
     )
-    # One unit was held and then committed.
+    # The inventory was already reserved during negotiation.
+    # Payment order creation must not commit the inventory.
     assert before == 9
     assert after == 9
+
+    hold = inventory.get_hold(
+        deal["hold_token"]
+    )
+    assert hold.state == "HELD"
+
+    transaction = transaction_store.get(
+        deal["transaction_id"]
+    )
+    assert transaction.state == TransactionState.PAYMENT_PENDING
+
+    data = response.json()
+    assert data["status"] == "PAYMENT_PENDING"
+    assert data["payment_id"]
+    assert data["amount"] == deal["total_amount"]
+    assert data["currency"] == deal["currency"]
 
 def test_invalid_hold_token_is_rejected():
     deal = create_negotiated_deal()
@@ -268,3 +355,216 @@ def test_same_idempotency_key_with_modified_payload_is_rejected():
 
     data = second.json()
     assert data["detail"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+def test_settlement_moves_transaction_to_payment_pending():
+    proposal = make_proposal()
+    negotiate_response = client.post(
+        "/api/v1/agent/negotiate",
+        json=proposal,
+    )
+    assert negotiate_response.status_code == 200
+
+    transaction_id = proposal["transaction_id"]
+    transaction = transaction_store.get(transaction_id)
+    assert transaction.state == TransactionState.HELD
+
+    response = client.post(
+        "/api/v1/agent/settle",
+        json={
+            "transaction_id": transaction_id,
+            "hold_token": negotiate_response.json()["hold_token"],
+            "nonce": "settlement_test_nonce_123456",
+        },
+        headers={
+            "Idempotency-Key": "settlement-state-test-001",
+        },
+    )
+    assert response.status_code in {200, 402, 409, 500}
+
+    transaction = transaction_store.get(transaction_id)
+    assert transaction.state == TransactionState.PAYMENT_PENDING
+
+def settle_payment(deal):
+    verification = verify_payment(deal)
+    response = client.post(
+        "/api/v1/agent/settle-payment",
+        json={
+            "transaction_id": deal["transaction_id"],
+            "payment_id": verification["payment_id"],
+        },
+    )
+    assert response.status_code == 200
+    return response.json()
+
+def test_settled_payment_can_commit_inventory():
+    deal = create_negotiated_deal()
+    before = inventory.get_available_quantity(
+        "LAPTOP-PRO-01"
+    )
+    settle_payment(deal)
+    transaction = transaction_store.get(
+        deal["transaction_id"]
+    )
+    assert transaction.state == TransactionState.SETTLED
+
+    response = client.post(
+        "/api/v1/agent/commit-inventory",
+        json={
+            "transaction_id": deal["transaction_id"],
+            "hold_token": deal["hold_token"],
+        },
+    )
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["transaction_id"] == deal["transaction_id"]
+    assert data["status"] == "INVENTORY_COMMITTED"
+
+    after = inventory.get_available_quantity(
+        "LAPTOP-PRO-01"
+    )
+    # Inventory was already removed from available stock
+    # when the hold was created.
+    assert before == 9
+    assert after == 9
+
+    hold = inventory.get_hold(
+        deal["hold_token"]
+    )
+    assert hold.state == "COMMITTED"
+
+    transaction = transaction_store.get(
+        deal["transaction_id"]
+    )
+    assert transaction.state == TransactionState.INVENTORY_COMMITTED
+
+def test_unsettled_payment_cannot_commit_inventory():
+    deal = create_negotiated_deal()
+    settle_deal(deal)
+    verify_payment(deal)
+    response = client.post(
+        "/api/v1/agent/commit-inventory",
+        json={
+            "transaction_id": deal["transaction_id"],
+            "hold_token": deal["hold_token"],
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "INVALID_TRANSACTION_STATE"
+
+    transaction = transaction_store.get(
+        deal["transaction_id"]
+    )
+    assert transaction.state == TransactionState.PAYMENT_VERIFIED
+
+def test_inventory_commit_rejects_invalid_hold_token():
+    deal = create_negotiated_deal()
+    settle_payment(deal)
+    response = client.post(
+        "/api/v1/agent/commit-inventory",
+        json={
+            "transaction_id": deal["transaction_id"],
+            "hold_token": "invalid-hold-token",
+        },
+    )
+    assert response.status_code == 409
+
+    transaction = transaction_store.get(
+        deal["transaction_id"]
+    )
+    assert transaction.state == TransactionState.SETTLED
+
+    hold = inventory.get_hold(
+        deal["hold_token"]
+    )
+    assert hold.state == "HELD"
+
+def commit_inventory(deal):
+    settle_payment(deal)
+    response = client.post(
+        "/api/v1/agent/commit-inventory",
+        json={
+            "transaction_id": deal["transaction_id"],
+            "hold_token": deal["hold_token"],
+        },
+    )
+    assert response.status_code == 200
+    return response.json()
+
+def test_committed_inventory_can_be_fulfilled():
+    deal = create_negotiated_deal()
+    commit_inventory(deal)
+    response = client.post(
+        "/api/v1/agent/fulfill",
+        json={
+            "transaction_id": deal["transaction_id"],
+            "hold_token": deal["hold_token"],
+        },
+    )
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["transaction_id"] == deal["transaction_id"]
+    assert data["receipt_id"]
+    assert data["status"] == "COMPLETED"
+    assert data["receipt_digest"]
+
+    transaction = transaction_store.get(
+        deal["transaction_id"]
+    )
+    assert transaction.state == TransactionState.COMPLETED
+    assert transaction.receipt_id == data["receipt_id"]
+
+    receipt = receipt_store.get(data["receipt_id"])
+    assert receipt.transaction_id == deal["transaction_id"]
+    assert receipt.payment_id == transaction.payment_id
+    assert receipt.amount == deal["total_amount"]
+    assert receipt.currency == deal["currency"]
+    assert receipt.sku == deal["sku"]
+    assert receipt.quantity == deal["quantity"]
+    assert receipt.receipt_digest == data["receipt_digest"]
+
+def test_fulfillment_requires_inventory_commitment():
+    deal = create_negotiated_deal()
+    settle_payment(deal)
+    response = client.post(
+        "/api/v1/agent/fulfill",
+        json={
+            "transaction_id": deal["transaction_id"],
+            "hold_token": deal["hold_token"],
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "INVALID_TRANSACTION_STATE"
+
+    transaction = transaction_store.get(
+        deal["transaction_id"]
+    )
+    assert transaction.state == TransactionState.SETTLED
+
+def test_completed_transaction_cannot_be_fulfilled_again():
+    deal = create_negotiated_deal()
+    commit_inventory(deal)
+    first = client.post(
+        "/api/v1/agent/fulfill",
+        json={
+            "transaction_id": deal["transaction_id"],
+            "hold_token": deal["hold_token"],
+        },
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/api/v1/agent/fulfill",
+        json={
+            "transaction_id": deal["transaction_id"],
+            "hold_token": deal["hold_token"],
+        },
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "INVALID_TRANSACTION_STATE"
+
+    transaction = transaction_store.get(
+        deal["transaction_id"]
+    )
+    assert transaction.state == TransactionState.COMPLETED

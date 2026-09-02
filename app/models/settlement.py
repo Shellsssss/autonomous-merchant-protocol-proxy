@@ -33,6 +33,29 @@ class SettlementRequest(BaseModel):
         description="Fresh nonce for replay protection.",
     )
 
+class PaymentOrderResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    transaction_id: str
+    payment_id: str
+    status: str
+    amount: int
+    currency: str
+
+class PaymentVerificationRequest(BaseModel):
+    """
+    Razorpay payment proof submitted by the buyer agent.
+    """
+    model_config = ConfigDict(extra="forbid")
+    transaction_id: str
+    payment_id: str
+    order_id: str
+    signature: str
+
+class PaymentVerificationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    transaction_id: str
+    payment_id: str
+    status: str
 
 class SettlementResult(BaseModel):
     """
@@ -44,4 +67,50 @@ class SettlementResult(BaseModel):
     status: str
     amount: int = Field(gt=0)
     currency: str
+    receipt_digest: str
+
+class PaymentSettlementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    transaction_id: str
+    payment_id: str
+
+class PaymentSettlementResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    transaction_id: str
+    payment_id: str
+    status: str
+
+class InventoryCommitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    transaction_id: str
+    hold_token: str
+
+class InventoryCommitResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    transaction_id: str
+    status: str
+
+class FulfillmentReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    receipt_id: str
+    transaction_id: str
+    merchant_id: str
+    payment_id: str
+    amount: int = Field(gt=0)
+    currency: str
+    sku: str
+    quantity: int = Field(gt=0)
+    issued_at: int = Field(gt=0)
+    receipt_digest: str
+
+class FulfillmentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    transaction_id: str
+    hold_token: str
+
+class FulfillmentResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    transaction_id: str
+    receipt_id: str
+    status: str
     receipt_digest: str

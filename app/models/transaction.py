@@ -24,6 +24,7 @@ class Transaction(BaseModel):
     updated_at: int = Field(gt=0)
     deal_id: str | None = None
     hold_token: str | None = None
+    payment_order_id: str | None = None
     payment_id: str | None = None
     receipt_id: str | None = None
 

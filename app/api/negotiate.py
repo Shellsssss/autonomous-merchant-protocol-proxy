@@ -26,6 +26,7 @@ from app.core.transaction_store import (
     transaction_store,
 )
 from app.models.transaction import Transaction
+from app.models.settlement import PaymentChallenge
 
 router = APIRouter(
     prefix="/api/v1/agent",
@@ -270,3 +271,78 @@ async def negotiate(proposal: PurchaseProposal) -> Deal:
         )
     )
     return deal
+
+@router.get(
+    "/transactions/{transaction_id}/payment",
+    response_model=PaymentChallenge,
+    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+)
+async def get_payment_challenge(transaction_id: str) -> PaymentChallenge:
+    """
+    Return an x402-style payment challenge for a held transaction.
+
+    Payment is required before the transaction can proceed to settlement.
+    No payment is executed by this endpoint.
+    """
+    settings = get_settings()
+
+    # 1. Retrieve transaction
+    try:
+        transaction = transaction_store.get(transaction_id)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "TRANSACTION_NOT_FOUND",
+                "message": "Transaction was not found.",
+            },
+        )
+
+    # 2. Payment challenge is only valid for an active inventory hold
+    if transaction.state != TransactionState.HELD:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "INVALID_TRANSACTION_STATE",
+                "message": (
+                    "Payment challenge is only available for a held transaction."
+                ),
+            },
+        )
+
+    # 3. Retrieve the corresponding deal
+    try:
+        deal = deal_store.get(transaction_id)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "DEAL_NOT_FOUND",
+                "message": "Deal was not found for this transaction.",
+            },
+        )
+
+    # 4. Verify the inventory hold is still active
+    try:
+        hold = inventory.get_hold(deal.hold_token)
+    except InventoryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": exc.code,
+                "message": exc.message,
+            },
+        )
+
+    # 5. Build x402 payment challenge
+    return PaymentChallenge(
+        protocol="x402",
+        version="1",
+        payment_required=True,
+        amount=deal.total_amount,
+        currency=deal.currency,
+        transaction_id=deal.transaction_id,
+        hold_token=hold.hold_token,
+        expires_at=hold.expires_at,
+        settlement_rail="razorpay",
+    )

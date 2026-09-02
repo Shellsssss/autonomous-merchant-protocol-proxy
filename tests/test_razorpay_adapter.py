@@ -1,4 +1,6 @@
 import pytest
+import hashlib
+import hmac
 from unittest.mock import Mock, patch
 from app.services.razorpay_adapter import (
     RazorpayAdapter,
@@ -143,4 +145,32 @@ def test_razorpay_response_without_order_id_is_rejected():
 
     assert exc_info.value.code == (
         "RAZORPAY_INVALID_RESPONSE"
+    )
+
+def test_payment_signature_verification():
+    adapter = RazorpayAdapter.__new__(RazorpayAdapter)
+    adapter.key_secret = "test_secret"
+
+    order_id = "order_test_123"
+    payment_id = "pay_test_123"
+
+    signature = hmac.new(
+        b"test_secret",
+        f"{order_id}|{payment_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    assert adapter.verify_payment_signature(
+        order_id=order_id,
+        payment_id=payment_id,
+        signature=signature,
+    )
+
+def test_invalid_payment_signature_is_rejected():
+    adapter = RazorpayAdapter.__new__(RazorpayAdapter)
+    adapter.key_secret = "test_secret"
+    assert not adapter.verify_payment_signature(
+        order_id="order_test_123",
+        payment_id="pay_test_123",
+        signature="invalid_signature",
     )
