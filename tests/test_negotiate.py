@@ -11,6 +11,7 @@ from app.main import app
 from app.models import Mandate, SpendingConstraints
 from app.api.negotiate import inventory
 from app.services.deal_store import deal_store
+from app.core.transaction_store import transaction_store
 
 @pytest.fixture(autouse=True)
 def reset_inventory():
@@ -19,6 +20,7 @@ def reset_inventory():
     inventory._inventory["HEADPHONES-01"].available_quantity = 50
     inventory._holds.clear()
     deal_store.clear()
+    transaction_store.clear()
 
 client = TestClient(app)
 

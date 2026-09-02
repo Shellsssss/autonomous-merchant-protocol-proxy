@@ -7,6 +7,7 @@ import app.api.settle as settle_module
 from app.services.deal_store import deal_store
 from app.services import razorpay_adapter as razorpay_module
 from app.services.razorpay_adapter import RazorpayOrder
+from app.core.transaction_store import transaction_store
 
 client = TestClient(app)
 
@@ -17,6 +18,9 @@ def reset_state(monkeypatch):
     inventory._inventory["PHONE-PRO-01"].available_quantity = 20
     inventory._inventory["HEADPHONES-01"].available_quantity = 50
     inventory._holds.clear()
+
+    # Reset transaction store
+    transaction_store.clear()
 
     # Reset settlement idempotency state
     settlement_ledger._records.clear()
