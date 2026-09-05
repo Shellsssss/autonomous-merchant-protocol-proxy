@@ -1,5 +1,5 @@
 from threading import Lock
-from app.core.transaction import TransactionState, TransactionStateError
+from app.core.transaction import TransactionState, TransactionStateError, _ALLOWED_TRANSITIONS
 from app.models.transaction import Transaction, TransactionEvent
 
 class TransactionNotFoundError(Exception):
@@ -56,53 +56,8 @@ class TransactionStore:
                 raise TransactionNotFoundError(transaction_id)
             current_state = transaction.state
 
-            allowed_transitions = {
-                TransactionState.PROPOSED: {
-                    TransactionState.VALIDATED,
-                    TransactionState.FAILED,
-                },
-                TransactionState.VALIDATED: {
-                    TransactionState.HELD,
-                    TransactionState.FAILED,
-                },
-                TransactionState.HELD: {
-                    TransactionState.PAYMENT_PENDING,
-                    TransactionState.EXPIRED,
-                    TransactionState.RELEASED,
-                    TransactionState.FAILED,
-                },
-                TransactionState.PAYMENT_PENDING: {
-                    TransactionState.PAYMENT_VERIFIED,
-                    TransactionState.EXPIRED,
-                    TransactionState.FAILED,
-                },
-                TransactionState.PAYMENT_VERIFIED: {
-                    TransactionState.SETTLING,
-                    TransactionState.FAILED,
-                },
-                TransactionState.SETTLING: {
-                    TransactionState.SETTLED,
-                    TransactionState.FAILED,
-                },
-                TransactionState.SETTLED: {
-                    TransactionState.INVENTORY_COMMITTED,
-                    TransactionState.FAILED,
-                },
-                TransactionState.INVENTORY_COMMITTED: {
-                    TransactionState.COMPLETED,
-                    TransactionState.FAILED,
-                },
-                TransactionState.COMPLETED: set(),
-                TransactionState.EXPIRED: set(),
-                TransactionState.RELEASED: set(),
-                TransactionState.FAILED: set(),
-            }
-
-            if target_state not in allowed_transitions[current_state]:
-                raise TransactionStateError(
-                    current_state,
-                    target_state,
-                )
+            if target_state not in _ALLOWED_TRANSITIONS[current_state]:
+                raise TransactionStateError(current_state, target_state)
 
             updated_transaction = transaction.model_copy(
                 update={

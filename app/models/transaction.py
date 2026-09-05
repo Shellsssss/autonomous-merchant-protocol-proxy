@@ -1,19 +1,5 @@
-from enum import Enum
 from pydantic import BaseModel, ConfigDict, Field
-
-class TransactionState(str, Enum):
-    PROPOSED = "PROPOSED"
-    VALIDATED = "VALIDATED"
-    HELD = "HELD"
-    PAYMENT_PENDING = "PAYMENT_PENDING"
-    PAYMENT_VERIFIED = "PAYMENT_VERIFIED"
-    SETTLING = "SETTLING"
-    SETTLED = "SETTLED"
-    INVENTORY_COMMITTED = "INVENTORY_COMMITTED"
-    COMPLETED = "COMPLETED"
-    EXPIRED = "EXPIRED"
-    RELEASED = "RELEASED"
-    FAILED = "FAILED"
+from app.core.transaction import TransactionState
 
 class Transaction(BaseModel):
     model_config = ConfigDict(extra="forbid")
