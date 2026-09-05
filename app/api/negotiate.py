@@ -18,6 +18,10 @@ from app.services.negotiator import (
     NegotiationRequest,
     negotiator,
 )
+from app.services.gemini_negotiator import (
+    GeminiNegotiatorError,
+    gemini_negotiator,
+)
 from app.models import Deal, PurchaseProposal
 from app.services.deal_store import deal_store
 from app.core.transaction import TransactionState
@@ -136,16 +140,48 @@ async def negotiate(proposal: PurchaseProposal) -> Deal:
             },
         )
 
-    # 6. Evaluate merchant invariants through the bounded negotiator.
-    # The negotiator is deterministic and does not trust any
-    # LLM-generated pricing decision.
+    # 6. Ask Gemini for a commercial negotiation suggestion.
+    #
+    # Gemini is an optional semantic negotiation layer.
+    # It NEVER authorizes spending.
+    try:
+        ai_result = gemini_negotiator.negotiate(
+            sku=proposal.items[0].sku,
+            quantity=total_quantity,
+            requested_unit_price=proposal.requested_unit_price,
+            category=proposal.category,
+            merchant_id=proposal.merchant_id,
+        )
+
+        ai_price = ai_result["suggested_unit_price"]
+        ai_decision = ai_result["decision"]
+        ai_reason = ai_result["reason"]
+
+    # except GeminiNegotiatorError:
+    except GeminiNegotiatorError as exc:
+        print(f"[GEMINI ERROR] {exc}")
+        # Fail open to the deterministic negotiation layer.
+        #
+        # This means:
+        # - Gemini being unavailable does not break commerce.
+        # - The requested price still has to pass all deterministic
+        #   merchant and mandate constraints.
+        # - Gemini can never authorize a transaction.
+        ai_price = proposal.requested_unit_price
+        ai_decision = "DETERMINISTIC_FALLBACK"
+        ai_reason = "AI negotiation unavailable; deterministic policy used."
+    # 7. Run the AI suggestion through the deterministic
+    # merchant policy engine.
+    #
+    # Gemini does NOT get to authorize the transaction.
     negotiation_request = NegotiationRequest(
         sku=proposal.items[0].sku,
         category=proposal.category,
         quantity=total_quantity,
         region=proposal.region,
-        requested_unit_price=proposal.requested_unit_price,
+        requested_unit_price=ai_price,
     )
+
     negotiation_result = negotiator.evaluate(negotiation_request)
 
     if not negotiation_result.approved:
@@ -155,11 +191,15 @@ async def negotiate(proposal: PurchaseProposal) -> Deal:
             timestamp=int(time.time()),
             reason=negotiation_result.reason_code,
         )
+
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
                 "code": negotiation_result.reason_code,
                 "message": negotiation_result.reason,
+                "ai_decision": ai_decision,
+                "ai_suggested_unit_price": ai_price,
+                "ai_reason": ai_reason,
             },
         )
 
@@ -216,8 +256,11 @@ async def negotiate(proposal: PurchaseProposal) -> Deal:
         },
     )
 
-    # 10. Calculate approved deal
-    approved_unit_price = proposal.requested_unit_price
+    # 10. Calculate the server-approved deal.
+    #
+    # This price originated from Gemini, but was approved only
+    # after passing the deterministic trust boundary.
+    approved_unit_price = ai_price
     total_amount = approved_unit_price * total_quantity
 
     # 11. Create the server-trusted deal
@@ -233,6 +276,10 @@ async def negotiate(proposal: PurchaseProposal) -> Deal:
         hold_token=hold.hold_token,
         expires_at=hold.expires_at,
         state=hold.state,
+        ai_suggested_unit_price=ai_price,
+        ai_decision=ai_decision,
+        ai_reason=ai_reason,
+        requested_unit_price=proposal.requested_unit_price,
     )
 
     # 12. Persist the deal. If this fails, release the inventory

@@ -38,8 +38,8 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # Gemini
-    gemini_api_key: str | None = None
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-3.6-flash"
 
     # Razorpay
     razorpay_key_id: str | None = None

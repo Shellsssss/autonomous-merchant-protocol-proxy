@@ -739,3 +739,78 @@ def test_fulfillment_rejects_idempotency_key_reuse_with_different_payload():
 
     assert second.status_code == 409
     assert second.json()["detail"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+def test_razorpay_order_failure_fails_transaction_and_releases_inventory(monkeypatch):
+    deal = create_negotiated_deal()
+
+    class FailingRazorpayAdapter:
+        def create_order(
+            self,
+            *,
+            transaction_id: str,
+            amount: int,
+            currency: str,
+        ) -> RazorpayOrder:
+            from app.services.razorpay_adapter import RazorpayError
+
+            raise RazorpayError(
+                "RAZORPAY_ORDER_CREATION_FAILED",
+                "Simulated Razorpay failure.",
+            )
+
+    monkeypatch.setattr(
+        settle_module,
+        "razorpay_adapter",
+        FailingRazorpayAdapter(),
+    )
+
+    response = client.post(
+        "/api/v1/agent/settle",
+        headers={
+            "Idempotency-Key": f"settle-failure-{deal['transaction_id']}",
+        },
+        json={
+            "transaction_id": deal["transaction_id"],
+            "hold_token": deal["hold_token"],
+            "nonce": f"nonce-failure-{deal['transaction_id']}-123456",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "RAZORPAY_ORDER_CREATION_FAILED"
+
+    transaction = transaction_store.get(deal["transaction_id"])
+    assert transaction.state == TransactionState.FAILED
+
+    hold = inventory.get_hold(deal["hold_token"])
+    assert hold.state == "RELEASED"
+    assert inventory.get_available_quantity(deal["sku"]) == 10
+
+def test_expired_hold_transitions_transaction_to_expired_and_rejects_settlement():
+    deal = create_negotiated_deal()
+
+    transaction = transaction_store.get(deal["transaction_id"])
+
+    hold = inventory.get_hold(deal["hold_token"])
+    hold.expires_at = 0
+
+    response = client.post(
+        "/api/v1/agent/settle",
+        headers={
+            "Idempotency-Key": f"settle-expired-{deal['transaction_id']}",
+        },
+        json={
+            "transaction_id": deal["transaction_id"],
+            "hold_token": deal["hold_token"],
+            "nonce": f"nonce-expired-{deal['transaction_id']}-123456",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "HOLD_EXPIRED"
+
+    transaction = transaction_store.get(deal["transaction_id"])
+    assert transaction.state == TransactionState.EXPIRED
+
+    hold = inventory.get_hold(deal["hold_token"])
+    assert hold.state == "EXPIRED"

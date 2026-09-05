@@ -84,15 +84,13 @@ def _get_hold_for_transaction(
     """
     Locate and validate the inventory hold belonging to a transaction.
 
-    The inventory implementation is currently owned by the
-    negotiation module, so we import its shared instance here.
+    If the inventory hold has expired, synchronize the transaction
+    state to EXPIRED before rejecting the operation.
     """
     from app.api.negotiate import inventory
 
     try:
-        hold = inventory.get_hold(
-            hold_token,
-        )
+        hold = inventory.get_hold(hold_token)
     except InventoryError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -111,6 +109,29 @@ def _get_hold_for_transaction(
                     "Inventory hold does not belong to "
                     "the requested transaction."
                 ),
+            },
+        )
+
+    if hold.state == "EXPIRED":
+        transaction = transaction_store.get(transaction_id)
+
+        if transaction.state in {
+            TransactionState.HELD,
+            TransactionState.PAYMENT_PENDING,
+        }:
+            transaction_store.update_state(
+                transaction_id,
+                TransactionState.EXPIRED,
+                timestamp=int(time.time()),
+                reason="Inventory hold expired.",
+                metadata={"hold_token": hold_token},
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "HOLD_EXPIRED",
+                "message": "Inventory hold has expired.",
             },
         )
 
@@ -248,11 +269,30 @@ async def settle(
             reason="Settlement request accepted; payment verification pending.",
         )
 
-        order = razorpay_adapter.create_order(
-            transaction_id=request.transaction_id,
-            amount=deal.total_amount,
-            currency=deal.currency,
-        )
+        try:
+            order = razorpay_adapter.create_order(
+                transaction_id=request.transaction_id,
+                amount=deal.total_amount,
+                currency=deal.currency,
+            )
+        except RazorpayError:
+            transaction_store.update_state(
+                request.transaction_id,
+                TransactionState.FAILED,
+                timestamp=int(time.time()),
+                reason="Razorpay order creation failed.",
+            )
+
+            try:
+                from app.api.negotiate import inventory
+
+                inventory.release_hold(
+                    request.hold_token,
+                )
+            except InventoryError:
+                pass
+
+            raise
 
         return {
             "payment_order_id": order.order_id,

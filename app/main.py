@@ -4,6 +4,7 @@ from app.api.negotiate import router as negotiate_router
 from app.config import get_settings
 from app.api.catalog import router as catalog_router
 from app.api.settle import router as settle_router
+from fastapi.middleware.cors import CORSMiddleware
 
 def create_app() -> FastAPI:
     settings = get_settings()
@@ -34,3 +35,13 @@ def create_app() -> FastAPI:
     return app
 
 app = create_app()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)

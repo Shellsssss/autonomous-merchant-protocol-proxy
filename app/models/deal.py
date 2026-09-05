@@ -1,4 +1,5 @@
 from pydantic import BaseModel, ConfigDict, Field
+from typing import Optional
 
 class Deal(BaseModel):
     """
@@ -28,3 +29,9 @@ class Deal(BaseModel):
     state: str = Field(
         description="Current transaction state.",
     )
+
+    # AI negotiation metadata
+    ai_suggested_unit_price: Optional[int] = None
+    ai_decision: Optional[str] = None
+    ai_reason: Optional[str] = None
+    requested_unit_price: int = Field(gt=0)
