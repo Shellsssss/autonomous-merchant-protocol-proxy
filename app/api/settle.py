@@ -48,6 +48,8 @@ router = APIRouter(
 settlement_ledger = IdempotencyLedger(ttl_seconds=300)
 payment_verification_ledger = IdempotencyLedger(ttl_seconds=300)
 payment_settlement_ledger = IdempotencyLedger(ttl_seconds=300)
+inventory_commit_ledger = IdempotencyLedger(ttl_seconds=300)
+fulfillment_ledger = IdempotencyLedger(ttl_seconds=300)
 
 def _receipt_digest(
     *,
@@ -466,188 +468,276 @@ def verify_payment(
     "/settle-payment",
     response_model=PaymentSettlementResult,
 )
-def settle_payment(request: PaymentSettlementRequest):
-    transaction = transaction_store.get(request.transaction_id)
-    if transaction.state != TransactionState.PAYMENT_VERIFIED:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "INVALID_TRANSACTION_STATE",
-                "message": (
-                    "Payment settlement requires PAYMENT_VERIFIED state, "
-                    f"but transaction is {transaction.state.value}."
-                ),
+def settle_payment(
+    request: PaymentSettlementRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+):
+    payload = {
+        "transaction_id": request.transaction_id,
+        "payment_id": request.payment_id,
+    }
+
+    def payment_settlement_operation():
+        transaction = transaction_store.get(request.transaction_id)
+        if transaction.state != TransactionState.PAYMENT_VERIFIED:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "INVALID_TRANSACTION_STATE",
+                    "message": (
+                        "Payment settlement requires PAYMENT_VERIFIED state, "
+                        f"but transaction is {transaction.state.value}."
+                    ),
+                },
+            )
+
+        if transaction.payment_id != request.payment_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PAYMENT_MISMATCH",
+                    "message": "Payment ID does not match the verified transaction.",
+                },
+            )
+
+        transaction_store.update_state(
+            request.transaction_id,
+            TransactionState.SETTLING,
+            timestamp=int(time.time()),
+            reason="Verified payment submitted for settlement.",
+            metadata={
+                "payment_id": request.payment_id,
             },
         )
 
-    if transaction.payment_id != request.payment_id:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "PAYMENT_MISMATCH",
-                "message": "Payment ID does not match the verified transaction.",
+        transaction_store.update_state(
+            request.transaction_id,
+            TransactionState.SETTLED,
+            timestamp=int(time.time()),
+            reason="Payment settlement completed.",
+            metadata={
+                "payment_id": request.payment_id,
             },
         )
 
-    transaction_store.update_state(
-        request.transaction_id,
-        TransactionState.SETTLING,
-        timestamp=int(time.time()),
-        reason="Verified payment submitted for settlement.",
-        metadata={
+        return {
+            "transaction_id": request.transaction_id,
             "payment_id": request.payment_id,
-        },
-    )
+            "status": "SETTLED",
+        }
 
-    transaction_store.update_state(
-        request.transaction_id,
-        TransactionState.SETTLED,
-        timestamp=int(time.time()),
-        reason="Payment settlement completed.",
-        metadata={
-            "payment_id": request.payment_id,
-        },
-    )
+    try:
+        result = payment_settlement_ledger.execute(
+            key=idempotency_key,
+            payload=payload,
+            nonce=idempotency_key,
+            timestamp=int(time.time()),
+            operation=payment_settlement_operation,
+        )
+    except IdempotencyConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": exc.code,
+                "message": exc.message,
+            },
+        ) from exc
 
-    return PaymentSettlementResult(
-        transaction_id=request.transaction_id,
-        payment_id=request.payment_id,
-        status="SETTLED",
-    )
+    return PaymentSettlementResult(**result)
 
 @router.post(
     "/commit-inventory",
     response_model=InventoryCommitResult,
 )
-def commit_inventory(request: InventoryCommitRequest):
-    transaction = transaction_store.get(request.transaction_id)
-    if transaction.state != TransactionState.SETTLED:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "INVALID_TRANSACTION_STATE",
-                "message": (
-                    "Inventory commitment requires SETTLED state, "
-                    f"but transaction is {transaction.state.value}."
-                ),
+def commit_inventory(
+    request: InventoryCommitRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+):
+    payload = {
+        "transaction_id": request.transaction_id,
+        "hold_token": request.hold_token,
+    }
+
+    def inventory_commit_operation():
+        transaction = transaction_store.get(request.transaction_id)
+
+        if transaction.state != TransactionState.SETTLED:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "INVALID_TRANSACTION_STATE",
+                    "message": (
+                        "Inventory commitment requires SETTLED state, "
+                        f"but transaction is {transaction.state.value}."
+                    ),
+                },
+            )
+
+        _get_hold_for_transaction(
+            transaction_id=request.transaction_id,
+            hold_token=request.hold_token,
+        )
+
+        try:
+            inventory.commit_hold(request.hold_token)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "INVENTORY_COMMIT_FAILED",
+                    "message": str(exc),
+                },
+            ) from exc
+
+        transaction_store.update_state(
+            request.transaction_id,
+            TransactionState.INVENTORY_COMMITTED,
+            timestamp=int(time.time()),
+            reason="Inventory hold committed after successful payment settlement.",
+            metadata={
+                "hold_token": request.hold_token,
             },
         )
 
-    hold = _get_hold_for_transaction(
-        transaction_id=request.transaction_id,
-        hold_token=request.hold_token,
-    )
+        return {
+            "transaction_id": request.transaction_id,
+            "status": "INVENTORY_COMMITTED",
+        }
 
     try:
-        inventory.commit_hold(request.hold_token)
-    except Exception as exc:
+        result = inventory_commit_ledger.execute(
+            key=idempotency_key,
+            payload=payload,
+            nonce=idempotency_key,
+            timestamp=int(time.time()),
+            operation=inventory_commit_operation,
+        )
+    except IdempotencyConflictError as exc:
         raise HTTPException(
             status_code=409,
             detail={
-                "code": "INVENTORY_COMMIT_FAILED",
-                "message": str(exc),
+                "code": exc.code,
+                "message": exc.message,
             },
         ) from exc
 
-    transaction_store.update_state(
-        request.transaction_id,
-        TransactionState.INVENTORY_COMMITTED,
-        timestamp=int(time.time()),
-        reason="Inventory hold committed after successful payment settlement.",
-        metadata={
-            "hold_token": request.hold_token,
-        },
-    )
-
-    return InventoryCommitResult(
-        transaction_id=request.transaction_id,
-        status="INVENTORY_COMMITTED",
-    )
+    return InventoryCommitResult(**result)
 
 @router.post(
     "/fulfill",
     response_model=FulfillmentResult,
 )
-def fulfill_transaction(request: FulfillmentRequest):
-    transaction = transaction_store.get(request.transaction_id)
-    if transaction.state != TransactionState.INVENTORY_COMMITTED:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "INVALID_TRANSACTION_STATE",
-                "message": (
-                    "Fulfillment requires INVENTORY_COMMITTED state, "
-                    f"but transaction is {transaction.state.value}."
-                ),
-            },
+def fulfill_transaction(
+    request: FulfillmentRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+):
+    payload = {
+        "transaction_id": request.transaction_id,
+        "hold_token": request.hold_token,
+    }
+
+    def fulfillment_operation():
+        transaction = transaction_store.get(request.transaction_id)
+
+        if transaction.state != TransactionState.INVENTORY_COMMITTED:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "INVALID_TRANSACTION_STATE",
+                    "message": (
+                        "Fulfillment requires INVENTORY_COMMITTED state, "
+                        f"but transaction is {transaction.state.value}."
+                    ),
+                },
+            )
+
+        if not transaction.payment_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PAYMENT_NOT_FOUND",
+                    "message": "Transaction does not have a verified payment.",
+                },
+            )
+
+        deal = deal_store.get(request.transaction_id)
+
+        if deal.hold_token != request.hold_token:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "HOLD_TOKEN_MISMATCH",
+                    "message": "Hold token does not match the transaction deal.",
+                },
+            )
+
+        receipt_id = f"receipt_{uuid.uuid4().hex}"
+        issued_at = int(time.time())
+
+        receipt_digest = _receipt_digest(
+            transaction_id=request.transaction_id,
+            payment_id=transaction.payment_id,
+            amount=deal.total_amount,
+            currency=deal.currency,
         )
 
-    if not transaction.payment_id:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "PAYMENT_NOT_FOUND",
-                "message": "Transaction does not have a verified payment.",
-            },
+        receipt = FulfillmentReceipt(
+            receipt_id=receipt_id,
+            transaction_id=request.transaction_id,
+            merchant_id=transaction.merchant_id,
+            payment_id=transaction.payment_id,
+            amount=deal.total_amount,
+            currency=deal.currency,
+            sku=deal.sku,
+            quantity=deal.quantity,
+            issued_at=issued_at,
+            receipt_digest=receipt_digest,
         )
 
-    deal = deal_store.get(request.transaction_id)
-    if deal.hold_token != request.hold_token:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "HOLD_TOKEN_MISMATCH",
-                "message": "Hold token does not match the transaction deal.",
-            },
+        receipt_store.create(receipt)
+
+        transaction_store.update(
+            transaction.model_copy(
+                update={
+                    "receipt_id": receipt_id,
+                    "updated_at": issued_at,
+                }
+            )
         )
 
-    receipt_id = f"receipt_{uuid.uuid4().hex}"
-    issued_at = int(time.time())
-
-    receipt_digest = _receipt_digest(
-        transaction_id=request.transaction_id,
-        payment_id=transaction.payment_id,
-        amount=deal.total_amount,
-        currency=deal.currency,
-    )
-
-    receipt = FulfillmentReceipt(
-        receipt_id=receipt_id,
-        transaction_id=request.transaction_id,
-        merchant_id=transaction.merchant_id,
-        payment_id=transaction.payment_id,
-        amount=deal.total_amount,
-        currency=deal.currency,
-        sku=deal.sku,
-        quantity=deal.quantity,
-        issued_at=issued_at,
-        receipt_digest=receipt_digest,
-    )
-
-    receipt_store.create(receipt)
-    transaction_store.update(
-        transaction.model_copy(
-            update={
+        transaction_store.update_state(
+            request.transaction_id,
+            TransactionState.COMPLETED,
+            timestamp=issued_at,
+            reason="Fulfillment receipt generated after inventory commitment.",
+            metadata={
                 "receipt_id": receipt_id,
-                "updated_at": issued_at,
-            }
+                "receipt_digest": receipt_digest,
+            },
         )
-    )
 
-    transaction_store.update_state(
-        request.transaction_id,
-        TransactionState.COMPLETED,
-        timestamp=issued_at,
-        reason="Fulfillment receipt generated after inventory commitment.",
-        metadata={
+        return {
+            "transaction_id": request.transaction_id,
             "receipt_id": receipt_id,
+            "status": "COMPLETED",
             "receipt_digest": receipt_digest,
-        },
-    )
+        }
 
-    return FulfillmentResult(
-        transaction_id=request.transaction_id,
-        receipt_id=receipt_id,
-        status="COMPLETED",
-        receipt_digest=receipt_digest,
-    )
+    try:
+        result = fulfillment_ledger.execute(
+            key=idempotency_key,
+            payload=payload,
+            nonce=idempotency_key,
+            timestamp=int(time.time()),
+            operation=fulfillment_operation,
+        )
+    except IdempotencyConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": exc.code,
+                "message": exc.message,
+            },
+        ) from exc
+
+    return FulfillmentResult(**result)

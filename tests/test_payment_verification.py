@@ -195,6 +195,9 @@ def test_verified_payment_can_be_settled():
     verification = verify_payment(deal)
     response = client.post(
         "/api/v1/agent/settle-payment",
+        headers={
+            "Idempotency-Key": f"payment-settle-{deal['transaction_id']}",
+        },
         json={
             "transaction_id": deal["transaction_id"],
             "payment_id": verification["payment_id"],
@@ -216,6 +219,9 @@ def test_unverified_payment_cannot_be_settled():
     payment = settle_deal(deal)
     response = client.post(
         "/api/v1/agent/settle-payment",
+        headers={
+            "Idempotency-Key": f"payment-settle-{deal['transaction_id']}",
+        },
         json={
             "transaction_id": deal["transaction_id"],
             "payment_id": "pay_test_123",
@@ -232,6 +238,9 @@ def test_settlement_rejects_payment_mismatch():
     verify_payment(deal)
     response = client.post(
         "/api/v1/agent/settle-payment",
+        headers={
+            "Idempotency-Key": f"payment-settle-{deal['transaction_id']}",
+        },
         json={
             "transaction_id": deal["transaction_id"],
             "payment_id": "pay_wrong",

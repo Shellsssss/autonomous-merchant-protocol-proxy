@@ -38,6 +38,18 @@ def reset_state(monkeypatch):
     settle_module.payment_verification_ledger._records.clear()
     settle_module.payment_verification_ledger._used_nonces.clear()
 
+    # Reset payment settlement ledger
+    settle_module.payment_settlement_ledger._records.clear()
+    settle_module.payment_settlement_ledger._used_nonces.clear()
+
+    # Reset inventory commit ledger
+    settle_module.inventory_commit_ledger._records.clear()
+    settle_module.inventory_commit_ledger._used_nonces.clear()
+
+    # Reset fullfilment ledger
+    settle_module.fulfillment_ledger._records.clear()
+    settle_module.fulfillment_ledger._used_nonces.clear()
+
     # Mock Razorpay for settlement tests
     class FakeRazorpayAdapter:
         def create_order(self, *, transaction_id: str, amount: int, currency: str) -> RazorpayOrder:
@@ -388,6 +400,9 @@ def settle_payment(deal):
     verification = verify_payment(deal)
     response = client.post(
         "/api/v1/agent/settle-payment",
+        headers={
+            "Idempotency-Key": f"payment-settle-{deal['transaction_id']}",
+        },
         json={
             "transaction_id": deal["transaction_id"],
             "payment_id": verification["payment_id"],
@@ -409,6 +424,9 @@ def test_settled_payment_can_commit_inventory():
 
     response = client.post(
         "/api/v1/agent/commit-inventory",
+        headers={
+            "Idempotency-Key": f"inventory-commit-{deal['transaction_id']}",
+        },
         json={
             "transaction_id": deal["transaction_id"],
             "hold_token": deal["hold_token"],
@@ -444,6 +462,9 @@ def test_unsettled_payment_cannot_commit_inventory():
     verify_payment(deal)
     response = client.post(
         "/api/v1/agent/commit-inventory",
+        headers={
+            "Idempotency-Key": f"inventory-commit-{deal['transaction_id']}",
+        },
         json={
             "transaction_id": deal["transaction_id"],
             "hold_token": deal["hold_token"],
@@ -462,6 +483,9 @@ def test_inventory_commit_rejects_invalid_hold_token():
     settle_payment(deal)
     response = client.post(
         "/api/v1/agent/commit-inventory",
+        headers={
+                "Idempotency-Key": f"inventory-commit-{deal['transaction_id']}",
+            },
         json={
             "transaction_id": deal["transaction_id"],
             "hold_token": "invalid-hold-token",
@@ -483,6 +507,9 @@ def commit_inventory(deal):
     settle_payment(deal)
     response = client.post(
         "/api/v1/agent/commit-inventory",
+        headers={
+            "Idempotency-Key": f"inventory-commit-{deal['transaction_id']}",
+        },
         json={
             "transaction_id": deal["transaction_id"],
             "hold_token": deal["hold_token"],
@@ -496,6 +523,9 @@ def test_committed_inventory_can_be_fulfilled():
     commit_inventory(deal)
     response = client.post(
         "/api/v1/agent/fulfill",
+        headers={
+            "Idempotency-Key": f"fulfill-{deal["transaction_id"]}",
+        },
         json={
             "transaction_id": deal["transaction_id"],
             "hold_token": deal["hold_token"],
@@ -529,6 +559,9 @@ def test_fulfillment_requires_inventory_commitment():
     settle_payment(deal)
     response = client.post(
         "/api/v1/agent/fulfill",
+        headers={
+            "Idempotency-Key": f"fulfill-{deal["transaction_id"]}",
+        },
         json={
             "transaction_id": deal["transaction_id"],
             "hold_token": deal["hold_token"],
@@ -547,6 +580,9 @@ def test_completed_transaction_cannot_be_fulfilled_again():
     commit_inventory(deal)
     first = client.post(
         "/api/v1/agent/fulfill",
+        headers={
+            "Idempotency-Key": f"fulfill-again-{deal['transaction_id']}",
+        },
         json={
             "transaction_id": deal["transaction_id"],
             "hold_token": deal["hold_token"],
@@ -556,6 +592,9 @@ def test_completed_transaction_cannot_be_fulfilled_again():
 
     second = client.post(
         "/api/v1/agent/fulfill",
+        headers={
+            "Idempotency-Key": f"fulfill-{deal['transaction_id']}",
+        },
         json={
             "transaction_id": deal["transaction_id"],
             "hold_token": deal["hold_token"],
@@ -568,3 +607,135 @@ def test_completed_transaction_cannot_be_fulfilled_again():
         deal["transaction_id"]
     )
     assert transaction.state == TransactionState.COMPLETED
+
+def test_settle_payment_is_idempotent():
+    deal = create_negotiated_deal()
+
+    verification = verify_payment(deal)
+
+    headers = {
+        "Idempotency-Key": f"payment-settle-idempotent-{deal['transaction_id']}",
+    }
+
+    payload = {
+        "transaction_id": deal["transaction_id"],
+        "payment_id": verification["payment_id"],
+    }
+
+    first_response = client.post(
+        "/api/v1/agent/settle-payment",
+        headers=headers,
+        json=payload,
+    )
+
+    assert first_response.status_code == 200
+
+    second_response = client.post(
+        "/api/v1/agent/settle-payment",
+        headers=headers,
+        json=payload,
+    )
+
+    assert second_response.status_code == 200
+    assert second_response.json() == first_response.json()
+
+def test_settle_payment_rejects_idempotency_key_reuse_with_different_payload():
+    deal = create_negotiated_deal()
+
+    verification = verify_payment(deal)
+
+    headers = {
+        "Idempotency-Key": f"payment-settle-conflict-{deal['transaction_id']}",
+    }
+
+    payload = {
+        "transaction_id": deal["transaction_id"],
+        "payment_id": verification["payment_id"],
+    }
+
+    first_response = client.post(
+        "/api/v1/agent/settle-payment",
+        headers=headers,
+        json=payload,
+    )
+
+    assert first_response.status_code == 200
+
+    conflicting_payload = {
+        "transaction_id": deal["transaction_id"],
+        "payment_id": "different-payment-id",
+    }
+
+    second_response = client.post(
+        "/api/v1/agent/settle-payment",
+        headers=headers,
+        json=conflicting_payload,
+    )
+
+    assert second_response.status_code == 409
+    assert second_response.json()["detail"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+def test_fulfillment_is_idempotent():
+    deal = create_negotiated_deal()
+    commit_inventory(deal)
+
+    headers = {
+        "Idempotency-Key": f"fulfill-idempotent-{deal['transaction_id']}",
+    }
+
+    payload = {
+        "transaction_id": deal["transaction_id"],
+        "hold_token": deal["hold_token"],
+    }
+
+    first = client.post(
+        "/api/v1/agent/fulfill",
+        headers=headers,
+        json=payload,
+    )
+
+    assert first.status_code == 200
+
+    second = client.post(
+        "/api/v1/agent/fulfill",
+        headers=headers,
+        json=payload,
+    )
+
+    assert second.status_code == 200
+    assert second.json() == first.json()
+
+def test_fulfillment_rejects_idempotency_key_reuse_with_different_payload():
+    deal = create_negotiated_deal()
+    commit_inventory(deal)
+
+    headers = {
+        "Idempotency-Key": f"fulfill-conflict-{deal['transaction_id']}",
+    }
+
+    first_payload = {
+        "transaction_id": deal["transaction_id"],
+        "hold_token": deal["hold_token"],
+    }
+
+    first = client.post(
+        "/api/v1/agent/fulfill",
+        headers=headers,
+        json=first_payload,
+    )
+
+    assert first.status_code == 200
+
+    conflicting_payload = {
+        "transaction_id": deal["transaction_id"],
+        "hold_token": "different-hold-token",
+    }
+
+    second = client.post(
+        "/api/v1/agent/fulfill",
+        headers=headers,
+        json=conflicting_payload,
+    )
+
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "IDEMPOTENCY_CONFLICT"
